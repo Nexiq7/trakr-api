@@ -1,0 +1,295 @@
+import { Hono } from 'hono';
+import { jwt, sign } from 'hono/jwt';
+import { cors } from 'hono/cors';
+import { bodyLimit } from 'hono/body-limit';
+import { secureHeaders } from 'hono/secure-headers';
+import { HTTPException } from 'hono/http-exception';
+import { eq, and } from 'drizzle-orm';
+import bcrypt from 'bcryptjs';
+
+import { env } from './env';
+import { db } from './db';
+import { users, watchlist } from './db/schema';
+import { rateLimit } from './rate-limit';
+import * as tvdb from './tvdb';
+import {
+  jsonBody,
+  parseSignup,
+  parseLogin,
+  parseTrack,
+  parseMediaType,
+  parseTvdbId,
+  parseSort,
+  parseSortType,
+  parseGenreIds,
+  parseSearchQuery,
+} from './validate';
+
+const app = new Hono();
+
+/** Tokens expire so a leaked one stops being useful; the SPA logs out on 401. */
+const TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+// --- GLOBAL MIDDLEWARE ---
+
+app.use('*', secureHeaders());
+app.use('*', bodyLimit({ maxSize: 32 * 1024 }));
+
+app.use(
+  '*',
+  cors({
+    origin: env.origins,
+    allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowHeaders: ['Content-Type', 'Authorization'],
+    exposeHeaders: ['Content-Length'],
+    maxAge: 600,
+    credentials: true,
+  })
+);
+
+/**
+ * One place where errors become responses. Validation failures and auth
+ * rejections carry their own status; everything else is logged server-side and
+ * reported as a generic 500, so stack traces and driver messages never reach
+ * the client.
+ */
+// Middleware-raised exceptions (body limit, JWT) carry a Response rather than a
+// message, so fall back to something the UI can actually display.
+const STATUS_FALLBACKS: Record<number, string> = {
+  401: 'Unauthorized',
+  413: 'Request body is too large',
+};
+
+app.onError((err, c) => {
+  if (err instanceof HTTPException) {
+    const message = err.message || STATUS_FALLBACKS[err.status] || 'Request failed';
+    return c.json({ error: message }, err.status);
+  }
+
+  console.error(`[${c.req.method} ${c.req.path}]`, err);
+  return c.json({ error: 'Something went wrong' }, 500);
+});
+
+app.notFound((c) => c.json({ error: 'Not found' }, 404));
+
+// --- HEALTH ---
+
+/** Liveness probe for Docker/Dokploy. Deliberately does not touch the database. */
+app.get('/health', (c) => c.json({ status: 'ok' }));
+
+// --- AUTH ROUTES ---
+
+// Credential endpoints are the ones worth brute-forcing, so they get the
+// tightest budget in the app.
+const authLimiter = rateLimit({
+  name: 'auth',
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: 'Too many attempts. Please try again in a few minutes.',
+});
+
+function issueToken(user: { id: number; username: string }) {
+  return sign(
+    {
+      id: user.id,
+      username: user.username,
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS,
+    },
+    env.jwtSecret
+  );
+}
+
+app.post('/auth/signup', authLimiter, async (c) => {
+  const { username, password } = parseSignup(await jsonBody(c));
+
+  const existing = await db.select().from(users).where(eq(users.username, username)).get();
+  if (existing) return c.json({ error: 'Username taken' }, 409);
+
+  const passwordHash = await bcrypt.hash(password, 10);
+
+  let created;
+  try {
+    created = await db.insert(users).values({ username, passwordHash }).returning();
+  } catch (e) {
+    // Two signups racing for the same name: the unique index is the source of
+    // truth, and the loser lands here.
+    if (String(e).includes('UNIQUE')) return c.json({ error: 'Username taken' }, 409);
+    throw e;
+  }
+
+  const user = created[0]!;
+  return c.json({ token: await issueToken(user), userId: user.id }, 201);
+});
+
+app.post('/auth/login', authLimiter, async (c) => {
+  const { username, password } = parseLogin(await jsonBody(c));
+
+  const user = await db.select().from(users).where(eq(users.username, username)).get();
+
+  // Hash even when the user doesn't exist, so response time doesn't reveal
+  // which usernames are registered.
+  const passwordHash = user?.passwordHash ?? '$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidin';
+  const valid = await bcrypt.compare(password, passwordHash);
+
+  if (!user || !valid) return c.json({ error: 'Invalid credentials' }, 401);
+
+  return c.json({ token: await issueToken(user) });
+});
+
+// --- PROTECTED ROUTES ---
+
+// Everything below requires a valid Bearer token.
+app.use('/api/*', jwt({ secret: env.jwtSecret, alg: 'HS256' }));
+
+type JwtPayload = { id: number; username: string };
+
+app.post('/api/track', async (c) => {
+  const payload = c.get('jwtPayload') as JwtPayload;
+  const { mediaId, type, status, score } = parseTrack(await jsonBody(c));
+
+  // Update in place when the row already exists so `createdAt` (and the row id)
+  // survive score/status edits instead of being wiped by a delete+reinsert.
+  const existing = await db
+    .select()
+    .from(watchlist)
+    .where(and(eq(watchlist.userId, payload.id), eq(watchlist.mediaId, mediaId)))
+    .get();
+
+  if (existing) {
+    const updated = await db
+      .update(watchlist)
+      .set({ type, status, score })
+      .where(eq(watchlist.id, existing.id))
+      .returning();
+
+    return c.json(updated[0]);
+  }
+
+  const inserted = await db
+    .insert(watchlist)
+    .values({ userId: payload.id, mediaId, type, score, status, createdAt: new Date() })
+    .returning();
+
+  return c.json(inserted[0]);
+});
+
+app.delete('/api/track/:mediaId', async (c) => {
+  const payload = c.get('jwtPayload') as JwtPayload;
+  const mediaId = c.req.param('mediaId');
+
+  await db
+    .delete(watchlist)
+    .where(and(eq(watchlist.userId, payload.id), eq(watchlist.mediaId, mediaId)));
+
+  return c.json({ success: true });
+});
+
+app.get('/api/watchlist-details', async (c) => {
+  const payload = c.get('jwtPayload') as JwtPayload;
+
+  const userItems = await db.select().from(watchlist).where(eq(watchlist.userId, payload.id));
+
+  // Fetch full (English-preferring) details for each item in parallel. A title
+  // TVDB can't resolve degrades to `details: null` rather than failing the
+  // whole collection.
+  const detailedList = await Promise.all(
+    userItems.map(async (item) => {
+      const actualId = item.mediaId.includes('-') ? item.mediaId.split('-')[1]! : item.mediaId;
+      const apiType = item.type === 'movie' ? 'movies' : 'series';
+
+      const details = await tvdb.getMediaDetails(apiType, actualId).catch(() => null);
+      return { ...item, details };
+    })
+  );
+
+  return c.json(detailedList);
+});
+
+// --- TVDB PUBLIC ROUTES (No Auth Required for Discovery) ---
+
+// Public, unauthenticated, and backed by our upstream API quota — so they get a
+// budget generous enough for real browsing but low enough to stop scraping.
+const tvdbLimiter = rateLimit({ name: 'tvdb', windowMs: 60 * 1000, max: 120 });
+
+app.use('/tvdb/*', tvdbLimiter);
+
+/** SEARCH: /tvdb/search?q=Breaking+Bad */
+app.get('/tvdb/search', async (c) => {
+  const query = parseSearchQuery(c.req.query('q'));
+  return c.json(await tvdb.search(query));
+});
+
+/** DETAILS: /tvdb/details/series/80348 */
+app.get('/tvdb/details/:type/:id', async (c) => {
+  const type = parseMediaType(c.req.param('type'));
+  const id = parseTvdbId(c.req.param('id'));
+
+  const data = await tvdb.getMediaDetails(type, id, { episodes: true });
+  return c.json({ data });
+});
+
+/** POPULAR: /tvdb/popular/series */
+app.get('/tvdb/popular/:type', async (c) => {
+  const type = parseMediaType(c.req.param('type'));
+  return c.json(await tvdb.popular(type));
+});
+
+/** GENRES: the Discover page's filter chips. */
+app.get('/tvdb/genres', async (c) => {
+  return c.json({ data: await tvdb.genres() });
+});
+
+/** BROWSE: /tvdb/browse/series?genre=18&sort=score&sortType=desc */
+app.get('/tvdb/browse/:type', async (c) => {
+  const type = parseMediaType(c.req.param('type'));
+  const sort = parseSort(c.req.query('sort'));
+  const sortType = parseSortType(c.req.query('sortType'));
+  const genreIds = parseGenreIds(c.req.query('genre'));
+  const trending = c.req.query('trending') === '1';
+
+  // TVDB's filter endpoint only accepts a single genre per request, so each
+  // genre is fetched (and cached) individually and multi-select is resolved as
+  // an intersection — items must match every selected genre.
+  const fetchList = (genreId?: string, year?: number) =>
+    tvdb.browse({ type, genreId, sort, sortType, year });
+
+  let data;
+  if (trending) {
+    // TVDB has no dedicated trending endpoint — approximate it as popular
+    // (score-sorted) content released/aired in the last two calendar years, so
+    // it surfaces what's currently popular rather than all-time hits. TVDB's
+    // `year` filter is fuzzy (occasionally returns older outliers), so the year
+    // is also enforced here to keep results honest.
+    const currentYear = new Date().getFullYear();
+    const targetYears = new Set([String(currentYear), String(currentYear - 1)]);
+    const genreId = genreIds[0];
+
+    const [thisYear, lastYear] = await Promise.all([
+      fetchList(genreId, currentYear),
+      fetchList(genreId, currentYear - 1),
+    ]);
+
+    const merged = new Map<string | number, any>();
+    for (const item of [...thisYear, ...lastYear]) {
+      if (targetYears.has(String(item.year))) merged.set(item.id, item);
+    }
+    data = [...merged.values()].sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 240);
+  } else if (genreIds.length <= 1) {
+    data = await fetchList(genreIds[0]);
+  } else {
+    const lists = await Promise.all(genreIds.map((id) => fetchList(id)));
+    const [first, ...rest] = lists;
+    const restIdSets = rest.map((list) => new Set(list.map((item: any) => item.id)));
+    data = first!.filter((item: any) => restIdSets.every((set) => set.has(item.id)));
+  }
+
+  return c.json({ data });
+});
+
+console.log(`trakr backend listening on :${env.port}`);
+
+export default {
+  port: env.port,
+  fetch: app.fetch,
+};

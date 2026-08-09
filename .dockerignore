@@ -1,0 +1,12 @@
+# Secrets must never be baked into an image — the build passes them at runtime.
+.env
+.env.*
+!.env.example
+
+node_modules
+.git
+.gitignore
+Dockerfile
+.dockerignore
+README.md
+migrations
