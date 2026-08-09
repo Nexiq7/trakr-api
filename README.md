@@ -54,3 +54,9 @@ Health check → `GET /health`.
 ## 🛠️ Tech stack
 
 Hono on Bun, Drizzle ORM, Turso (libsql), bcryptjs + hono-sessions for auth.
+
+## 📄 License
+
+[MIT](LICENSE) © Nexiq7. Series and episode data comes from TheTVDB and remains
+subject to [their API terms](https://thetvdb.com/api-information) — this license
+covers the code only.

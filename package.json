@@ -1,5 +1,6 @@
 {
   "name": "trakr-api",
+  "license": "MIT",
   "scripts": {
     "dev": "bun run --hot src/index.ts",
     "start": "bun run src/index.ts",
