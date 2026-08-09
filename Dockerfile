@@ -9,7 +9,12 @@ RUN bun install --frozen-lockfile --production
 
 COPY . .
 
-# Drop root — the app only ever reads its own files.
+# Default home for a self-hosted SQLite database. Created and chowned here so a
+# named volume mounted at /data inherits that ownership — Docker would otherwise
+# create it root-owned, leaving the unprivileged app unable to write.
+RUN mkdir -p /data && chown bun:bun /data
+
+# Drop root — the app only ever writes to its database.
 USER bun
 
 EXPOSE 3007

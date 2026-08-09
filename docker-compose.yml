@@ -1,0 +1,48 @@
+# Runs the whole of trakr — API and web client — on one machine.
+#
+#   cp .env.example .env    # add your TVDB key, set a JWT secret
+#   docker compose up
+#
+# Web client → http://localhost:8080
+# API        → http://localhost:3007
+#
+# The database is a SQLite file on the `trakr-data` volume. Nothing is sent
+# anywhere except TheTVDB, and no cloud account is involved.
+
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    # Applies the schema before serving, so a fresh volume comes up usable.
+    # Idempotent: on an existing database with no schema changes it's a no-op.
+    command: sh -c "bun run db:push --force && bun run src/index.ts"
+    ports:
+      - "${API_PORT:-3007}:3007"
+    environment:
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      TVDB_KEY: ${TVDB_KEY:?set TVDB_KEY in .env}
+      # Overrides whatever DATABASE_URL is in .env: inside the container the
+      # database belongs on the mounted volume, not in the build context.
+      DATABASE_URL: file:/data/trakr.db
+      # The browser talks to the client's origin, so that's what CORS allows.
+      ORIGIN: ${WEB_ORIGIN:-http://localhost:8080}
+      NODE_ENV: production
+    volumes:
+      - trakr-data:/data
+
+  web:
+    # Built from source rather than pulled: VITE_API_URL is compiled into the
+    # bundle, so the published image points at trakr.lol and would be useless
+    # here. Pin a tag or commit instead of `main` if you want reproducibility.
+    build:
+      context: https://github.com/Nexiq7/trakr-web.git#main
+      args:
+        VITE_API_URL: ${PUBLIC_API_URL:-http://localhost:3007}
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      - api
+
+volumes:
+  trakr-data:
