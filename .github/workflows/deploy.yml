@@ -32,7 +32,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ env.GHCR_OWNER }}/trakr-backend:latest
+          tags: ghcr.io/${{ env.GHCR_OWNER }}/trakr-api:latest
 
       - name: Ping Dokploy to Refresh Container
         run: |
