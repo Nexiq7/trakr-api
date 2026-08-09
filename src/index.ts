@@ -11,6 +11,8 @@ import { env } from './env';
 import { db } from './db';
 import { users, watchlist } from './db/schema';
 import { rateLimit } from './rate-limit';
+import { logger } from './logger';
+import { getClientIp } from './ip';
 import * as tvdb from './tvdb';
 import {
   jsonBody,
@@ -31,6 +33,24 @@ const app = new Hono();
 const TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 // --- GLOBAL MIDDLEWARE ---
+
+// One line per request, after it's handled, so the status code (including
+// ones `onError` produces) is known. Registered first so the timer covers
+// every downstream middleware and the route handler.
+app.use('*', async (c, next) => {
+  const start = Date.now();
+  await next();
+
+  const jwtPayload = c.get('jwtPayload') as { id: number } | undefined;
+  logger.info('request', {
+    method: c.req.method,
+    path: c.req.path,
+    status: c.res.status,
+    durationMs: Date.now() - start,
+    ip: getClientIp(c),
+    userId: jwtPayload?.id,
+  });
+});
 
 app.use('*', secureHeaders());
 app.use('*', bodyLimit({ maxSize: 32 * 1024 }));
@@ -66,7 +86,12 @@ app.onError((err, c) => {
     return c.json({ error: message }, err.status);
   }
 
-  console.error(`[${c.req.method} ${c.req.path}]`, err);
+  logger.error('unhandled error', {
+    method: c.req.method,
+    path: c.req.path,
+    error: err instanceof Error ? err.message : String(err),
+    stack: err instanceof Error ? err.stack : undefined,
+  });
   return c.json({ error: 'Something went wrong' }, 500);
 });
 
@@ -119,6 +144,7 @@ app.post('/auth/signup', authLimiter, async (c) => {
   }
 
   const user = created[0]!;
+  logger.info('user signed up', { userId: user.id, username: user.username });
   return c.json({ token: await issueToken(user), userId: user.id }, 201);
 });
 
@@ -132,8 +158,12 @@ app.post('/auth/login', authLimiter, async (c) => {
   const passwordHash = user?.passwordHash ?? '$2a$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidin';
   const valid = await bcrypt.compare(password, passwordHash);
 
-  if (!user || !valid) return c.json({ error: 'Invalid credentials' }, 401);
+  if (!user || !valid) {
+    logger.warn('login failed', { username });
+    return c.json({ error: 'Invalid credentials' }, 401);
+  }
 
+  logger.info('user logged in', { userId: user.id, username: user.username });
   return c.json({ token: await issueToken(user) });
 });
 
@@ -163,6 +193,7 @@ app.post('/api/track', async (c) => {
       .where(eq(watchlist.id, existing.id))
       .returning();
 
+    logger.info('watchlist item updated', { userId: payload.id, mediaId, status, score });
     return c.json(updated[0]);
   }
 
@@ -171,6 +202,7 @@ app.post('/api/track', async (c) => {
     .values({ userId: payload.id, mediaId, type, score, status, createdAt: new Date() })
     .returning();
 
+  logger.info('watchlist item added', { userId: payload.id, mediaId, type, status, score });
   return c.json(inserted[0]);
 });
 
@@ -182,6 +214,7 @@ app.delete('/api/track/:mediaId', async (c) => {
     .delete(watchlist)
     .where(and(eq(watchlist.userId, payload.id), eq(watchlist.mediaId, mediaId)));
 
+  logger.info('watchlist item removed', { userId: payload.id, mediaId });
   return c.json({ success: true });
 });
 
@@ -287,7 +320,7 @@ app.get('/tvdb/browse/:type', async (c) => {
   return c.json({ data });
 });
 
-console.log(`trakr backend listening on :${env.port}`);
+logger.info('trakr backend listening', { port: env.port });
 
 export default {
   port: env.port,

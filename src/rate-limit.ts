@@ -1,5 +1,6 @@
-import type { Context, MiddlewareHandler } from 'hono';
-import { getConnInfo } from 'hono/bun';
+import type { MiddlewareHandler } from 'hono';
+import { getClientIp } from './ip';
+import { logger } from './logger';
 
 /**
  * Fixed-window rate limiting, keyed by client IP.
@@ -15,19 +16,6 @@ type Bucket = { count: number; resetAt: number };
 const buckets = new Map<string, Bucket>();
 const MAX_TRACKED_CLIENTS = 10_000;
 
-function clientKey(c: Context): string {
-  // Behind Dokploy/Traefik the real client address is only in X-Forwarded-For.
-  // The left-most entry is the originating client.
-  const forwarded = c.req.header('x-forwarded-for');
-  if (forwarded) return forwarded.split(',')[0]!.trim();
-
-  try {
-    return getConnInfo(c).remote.address ?? 'unknown';
-  } catch {
-    return 'unknown';
-  }
-}
-
 /** Drop expired buckets so a stream of unique IPs can't grow the map forever. */
 function sweep(now: number) {
   for (const [key, bucket] of buckets) {
@@ -42,7 +30,8 @@ export function rateLimit(opts: { name: string; windowMs: number; max: number; m
     const now = Date.now();
     if (buckets.size > MAX_TRACKED_CLIENTS) sweep(now);
 
-    const key = `${name}:${clientKey(c)}`;
+    const ip = getClientIp(c);
+    const key = `${name}:${ip}`;
     const bucket = buckets.get(key);
 
     if (!bucket || bucket.resetAt <= now) {
@@ -53,6 +42,7 @@ export function rateLimit(opts: { name: string; windowMs: number; max: number; m
     if (bucket.count >= max) {
       const retryAfter = Math.ceil((bucket.resetAt - now) / 1000);
       c.header('Retry-After', String(retryAfter));
+      logger.warn('rate limit exceeded', { limiter: name, ip, path: c.req.path });
       return c.json({ error: message }, 429);
     }
 
