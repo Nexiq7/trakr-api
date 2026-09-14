@@ -37,10 +37,16 @@ const LIST_PAGES = 5;
 const FILTERED_TRENDING_PAGES = 10;
 
 /**
- * A title needs a few votes before its popularity figure means much; below
- * this, "popular" fills with titles that spiked on a handful of page views.
+ * A title needs votes before its popularity figure means much.
+ *
+ * TV needs far more than movies. TMDB's TV popularity rewards sheer episode
+ * count, so with a low bar the list filled with decades-long children's and
+ * franchise shows — Sesame Street, Kamen Rider, Doraemon — on a few hundred
+ * votes each. At 500 they drop out and the list is shows people actually
+ * binge. Movies keep a low bar so this month's releases, which haven't
+ * gathered many votes yet, still make it in.
  */
-const MIN_VOTES = 100;
+const MIN_VOTES: Record<TmdbType, number> = { movie: 100, tv: 500 };
 
 const configured = Boolean(env.tmdbKey);
 
@@ -85,6 +91,22 @@ interface TmdbListItem {
 
 // --- HTTP ------------------------------------------------------------------
 
+const MAX_RETRIES = 3;
+
+let rateLimited = 0;
+
+function send(url: string, headers: Record<string, string>) {
+  return fetch(url, { headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) }).then((res) => {
+    if (res.status === 429) rateLimited += 1;
+    return res;
+  });
+}
+
+/** How many times TMDB has rate-limited this process — for diagnostics. */
+export function rateLimitCount() {
+  return rateLimited;
+}
+
 async function tmdbJson<T>(path: string, params: Record<string, string> = {}): Promise<T> {
   const query = new URLSearchParams({ language: 'en-US', ...params });
   const headers: Record<string, string> = { Accept: 'application/json' };
@@ -95,10 +117,18 @@ async function tmdbJson<T>(path: string, params: Record<string, string> = {}): P
   if (env.tmdbKey.startsWith('eyJ')) headers.Authorization = `Bearer ${env.tmdbKey}`;
   else query.set('api_key', env.tmdbKey);
 
-  const res = await fetch(`${TMDB_BASE}${path}?${query}`, {
-    headers,
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
+  let res = await send(`${TMDB_BASE}${path}?${query}`, headers);
+
+  // A cold list fires a burst of lookups, which TMDB can answer with 429. A
+  // lookup that gives up drops its title from a list cached for half an hour,
+  // so wait out the limit (TMDB says how long) and try again.
+  for (let attempt = 1; res.status === 429 && attempt <= MAX_RETRIES; attempt += 1) {
+    const retryAfter = Number(res.headers.get('retry-after'));
+    const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 500 * attempt;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(waitMs, 5000)));
+    res = await send(`${TMDB_BASE}${path}?${query}`, headers);
+  }
+
   if (res.status === 401 && !rejected) {
     rejected = true;
     logger.error('TMDB rejected TMDB_KEY; serving TVDB lists until restart', { path });
@@ -124,7 +154,9 @@ function limit(max: number) {
   };
 }
 
-const lookups = limit(8);
+// 16 at once roughly halves a cold genre list against 8, and stays inside
+// TMDB's rate limit in practice; the 429 retry above covers the edges.
+const lookups = limit(16);
 
 // --- TMDB id -> TVDB id ----------------------------------------------------
 
@@ -307,7 +339,7 @@ export function popular(type: ApiType, genres: number[] = [], { force = false } 
   return (force ? tvdb.refresh : tvdb.cached)(key, LIST_TTL_MS, async () => {
     const params: Record<string, string> = {
       sort_by: 'popularity.desc',
-      'vote_count.gte': String(MIN_VOTES),
+      'vote_count.gte': String(MIN_VOTES[kind]),
       include_adult: 'false',
     };
     // A comma in `with_genres` means "all of these", matching the web client.
