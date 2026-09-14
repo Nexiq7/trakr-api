@@ -14,6 +14,7 @@ import { rateLimit } from './rate-limit';
 import { logger } from './logger';
 import { getClientIp } from './ip';
 import * as tvdb from './tvdb';
+import * as tmdb from './tmdb';
 import {
   jsonBody,
   parseSignup,
@@ -262,9 +263,34 @@ app.get('/tvdb/details/:type/:id', async (c) => {
   return c.json({ data });
 });
 
+/**
+ * A list from TMDB, or null when TMDB isn't configured, can't express the
+ * request, or is failing.
+ *
+ * Callers fall through to the TVDB list on null, so TMDB is strictly an
+ * upgrade: an outage or a missing key degrades to the old lists, never to an
+ * error page.
+ */
+async function fromTmdb(load: () => Promise<tmdb.CatalogItem[]>) {
+  if (!tmdb.isEnabled()) return null;
+  try {
+    return await load();
+  } catch (error) {
+    if (error instanceof tmdb.UnmappedGenre) return null;
+    logger.warn('tmdb list failed, using tvdb', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
 /** POPULAR: /tvdb/popular/series */
 app.get('/tvdb/popular/:type', async (c) => {
   const type = parseMediaType(c.req.param('type'));
+
+  const data = await fromTmdb(() => tmdb.popular(type));
+  if (data) return c.json({ data });
+
   return c.json(await tvdb.popular(type));
 });
 
@@ -280,6 +306,20 @@ app.get('/tvdb/browse/:type', async (c) => {
   const sortType = parseSortType(c.req.query('sortType'));
   const genreIds = parseGenreIds(c.req.query('genre'));
   const trending = c.req.query('trending') === '1';
+
+  // Trending and most-popular are the lists TVDB can't produce honestly, so
+  // they come from TMDB when every selected genre has a TMDB equivalent.
+  // Newest and A-Z are plain catalog orderings and stay on TVDB.
+  const popularity = trending || (sort === 'score' && sortType === 'desc');
+  if (popularity) {
+    const data = await fromTmdb(async () => {
+      const tmdbGenreIds = await tmdb.mapGenres(type, genreIds);
+      // A genre TMDB doesn't have: let TVDB answer rather than guess.
+      if (tmdbGenreIds === null) throw new tmdb.UnmappedGenre();
+      return trending ? tmdb.trending(type, tmdbGenreIds) : tmdb.popular(type, tmdbGenreIds);
+    });
+    if (data) return c.json({ data });
+  }
 
   // TVDB's filter endpoint only accepts a single genre per request, so each
   // genre is fetched (and cached) individually and multi-select is resolved as
@@ -320,7 +360,8 @@ app.get('/tvdb/browse/:type', async (c) => {
   return c.json({ data });
 });
 
-logger.info('trakr backend listening', { port: env.port });
+logger.info('trakr backend listening', { port: env.port, tmdb: tmdb.isEnabled() });
+tmdb.startWarming();
 
 export default {
   port: env.port,

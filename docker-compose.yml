@@ -21,6 +21,8 @@ services:
     environment:
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       TVDB_KEY: ${TVDB_KEY:?set TVDB_KEY in .env}
+      # Optional: trending and popular lists from TMDB instead of TVDB's score.
+      TMDB_KEY: ${TMDB_KEY:-}
       # Overrides whatever DATABASE_URL is in .env: inside the container the
       # database belongs on the mounted volume, not in the build context.
       DATABASE_URL: file:/data/trakr.db
