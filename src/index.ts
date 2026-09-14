@@ -26,6 +26,7 @@ import {
   parseSortType,
   parseGenreIds,
   parseSearchQuery,
+  parsePage,
 } from './validate';
 
 const app = new Hono();
@@ -271,7 +272,7 @@ app.get('/tvdb/details/:type/:id', async (c) => {
  * upgrade: an outage or a missing key degrades to the old lists, never to an
  * error page.
  */
-async function fromTmdb(load: () => Promise<tmdb.CatalogItem[]>) {
+async function fromTmdb<T>(load: () => Promise<T>): Promise<T | null> {
   if (!tmdb.isEnabled()) return null;
   try {
     return await load();
@@ -299,12 +300,23 @@ app.get('/tvdb/genres', async (c) => {
   return c.json({ data: await tvdb.genres() });
 });
 
-/** BROWSE: /tvdb/browse/series?genre=18&sort=score&sortType=desc */
+/** Titles per page for lists served from TVDB, which returns them all at once. */
+const TVDB_PAGE_SIZE = 24;
+
+/**
+ * BROWSE: /tvdb/browse/series?genre=18,6&sort=score&sortType=desc
+ *
+ * Also `?trending=1`. Several genres mean "all of these".
+ * Without `page` the whole list comes back as `{ data }` (the home page's
+ * rails); with `page=N` it's `{ data, page, hasMore }`, which is what Discover
+ * scrolls through.
+ */
 app.get('/tvdb/browse/:type', async (c) => {
   const type = parseMediaType(c.req.param('type'));
   const sort = parseSort(c.req.query('sort'));
   const sortType = parseSortType(c.req.query('sortType'));
   const genreIds = parseGenreIds(c.req.query('genre'));
+  const page = parsePage(c.req.query('page'));
   const trending = c.req.query('trending') === '1';
 
   // Trending and most-popular are the lists TVDB can't produce honestly, so
@@ -312,13 +324,16 @@ app.get('/tvdb/browse/:type', async (c) => {
   // Newest and A-Z are plain catalog orderings and stay on TVDB.
   const popularity = trending || (sort === 'score' && sortType === 'desc');
   if (popularity) {
-    const data = await fromTmdb(async () => {
+    const list = trending ? 'trending' : 'popular';
+    const result = await fromTmdb(async () => {
       const tmdbGenreIds = await tmdb.mapGenres(type, genreIds);
       // A genre TMDB doesn't have: let TVDB answer rather than guess.
       if (tmdbGenreIds === null) throw new tmdb.UnmappedGenre();
-      return trending ? tmdb.trending(type, tmdbGenreIds) : tmdb.popular(type, tmdbGenreIds);
+      return page === null
+        ? { data: await (trending ? tmdb.trending : tmdb.popular)(type, tmdbGenreIds) }
+        : tmdb.listPage(list, type, tmdbGenreIds, page);
     });
-    if (data) return c.json({ data });
+    if (result) return c.json(result);
   }
 
   // TVDB's filter endpoint only accepts a single genre per request, so each
@@ -327,7 +342,15 @@ app.get('/tvdb/browse/:type', async (c) => {
   const fetchList = (genreId?: string, year?: number) =>
     tvdb.browse({ type, genreId, sort, sortType, year });
 
-  let data;
+  const intersect = (lists: any[][]) => {
+    const [first = [], ...rest] = lists;
+    const restIdSets = rest.map((list) => new Set(list.map((item: any) => item.id)));
+    return first.filter((item: any) => restIdSets.every((set) => set.has(item.id)));
+  };
+
+  const genreRuns = genreIds.length > 0 ? genreIds : [undefined];
+
+  let data: any[];
   if (trending) {
     // TVDB has no dedicated trending endpoint — approximate it as popular
     // (score-sorted) content released/aired in the last two calendar years, so
@@ -336,28 +359,33 @@ app.get('/tvdb/browse/:type', async (c) => {
     // is also enforced here to keep results honest.
     const currentYear = new Date().getFullYear();
     const targetYears = new Set([String(currentYear), String(currentYear - 1)]);
-    const genreId = genreIds[0];
 
-    const [thisYear, lastYear] = await Promise.all([
-      fetchList(genreId, currentYear),
-      fetchList(genreId, currentYear - 1),
-    ]);
-
-    const merged = new Map<string | number, any>();
-    for (const item of [...thisYear, ...lastYear]) {
-      if (targetYears.has(String(item.year))) merged.set(item.id, item);
-    }
-    data = [...merged.values()].sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 240);
-  } else if (genreIds.length <= 1) {
-    data = await fetchList(genreIds[0]);
+    const perGenre = await Promise.all(
+      genreRuns.map(async (genreId) => {
+        const [thisYear, lastYear] = await Promise.all([
+          fetchList(genreId, currentYear),
+          fetchList(genreId, currentYear - 1),
+        ]);
+        const merged = new Map<string | number, any>();
+        for (const item of [...thisYear, ...lastYear]) {
+          if (targetYears.has(String(item.year))) merged.set(item.id, item);
+        }
+        return [...merged.values()].sort((a, b) => (b.score || 0) - (a.score || 0));
+      }),
+    );
+    data = intersect(perGenre).slice(0, 240);
   } else {
-    const lists = await Promise.all(genreIds.map((id) => fetchList(id)));
-    const [first, ...rest] = lists;
-    const restIdSets = rest.map((list) => new Set(list.map((item: any) => item.id)));
-    data = first!.filter((item: any) => restIdSets.every((set) => set.has(item.id)));
+    data = intersect(await Promise.all(genreRuns.map((id) => fetchList(id))));
   }
 
-  return c.json({ data });
+  if (page === null) return c.json({ data });
+
+  const start = (page - 1) * TVDB_PAGE_SIZE;
+  return c.json({
+    data: data.slice(start, start + TVDB_PAGE_SIZE),
+    page,
+    hasMore: start + TVDB_PAGE_SIZE < data.length,
+  });
 });
 
 logger.info('trakr backend listening', { port: env.port, tmdb: tmdb.isEnabled() });

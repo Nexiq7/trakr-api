@@ -132,6 +132,13 @@ export function parseGenreIds(value: string | undefined): string[] {
   return ids;
 }
 
+/** Optional 1-based page number; absent means "the whole list". */
+export function parsePage(value: string | undefined): number | null {
+  if (value === undefined || value === '') return null;
+  if (!/^\d{1,3}$/.test(value) || Number(value) < 1) bad('page must be a whole number from 1');
+  return Number(value);
+}
+
 const MAX_QUERY_LENGTH = 100;
 
 export function parseSearchQuery(value: string | undefined): string {

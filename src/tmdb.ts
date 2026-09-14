@@ -207,8 +207,9 @@ async function resolve(type: TmdbType, items: TmdbListItem[]): Promise<CatalogIt
   items.forEach((item, index) => {
     const id = ids[index];
     // Two TMDB entries can point at one TVDB title; the first (higher-ranked)
-    // one wins so the list never shows a title twice.
-    if (id == null || seen.has(id)) return;
+    // one wins so the list never shows a title twice. Titles without a poster
+    // are dropped too: in a rail of artwork they read as broken cards.
+    if (id == null || seen.has(id) || !item.poster_path) return;
     seen.add(id);
 
     const date = item.release_date || item.first_air_date;
@@ -223,21 +224,6 @@ async function resolve(type: TmdbType, items: TmdbListItem[]): Promise<CatalogIt
   });
 
   return resolved;
-}
-
-async function pages(path: string, params: Record<string, string>, count: number) {
-  const results = await Promise.all(
-    Array.from({ length: count }, (_, index) =>
-      tmdbJson<{ results?: TmdbListItem[] }>(path, { ...params, page: String(index + 1) })
-        .then((json) => json.results ?? [])
-        // A later page failing shouldn't sink the ones that loaded.
-        .catch((error) => {
-          if (index === 0) throw error;
-          return [];
-        }),
-    ),
-  );
-  return results.flat();
 }
 
 // --- Genres ----------------------------------------------------------------
@@ -308,47 +294,140 @@ const TV_TALK = 10767;
 const TV_NEWS = 10763;
 const TV_SOAP = 10766;
 
-/** What's trending this week, optionally narrowed to genres (all must match). */
-export function trending(type: ApiType, genres: number[] = [], { force = false } = {}) {
+/**
+ * The deepest page Discover will scroll to. TMDB serves up to 500, but past a
+ * few hundred titles a popularity-ordered list is noise, and each page costs a
+ * round of TVDB lookups.
+ */
+const MAX_PAGES = 25;
+
+export type ListName = 'trending' | 'popular';
+
+export interface CatalogPage {
+  data: CatalogItem[];
+  page: number;
+  hasMore: boolean;
+}
+
+const genreKey = (genres: number[]) => [...genres].sort((a, b) => a - b).join(',');
+
+interface ListSpec {
+  path: string;
+  params: Record<string, string>;
+  /** Filtering TMDB can't do server-side, applied to each page. */
+  keep: (item: TmdbListItem) => boolean;
+  /** How many pages the unpaged list — the home page rails — is built from. */
+  fullPages: number;
+}
+
+function specFor(list: ListName, kind: TmdbType, genres: number[]): ListSpec {
+  if (list === 'trending') {
+    // Trending has no genre filter, so genres are matched per item, and the
+    // unpaged list reads further into the chart to find enough of them.
+    const excluded = kind === 'tv' ? [TV_TALK, TV_NEWS] : [];
+    return {
+      path: `/trending/${kind}/week`,
+      params: {},
+      keep: (item) => {
+        const itemGenres = item.genre_ids ?? [];
+        if (itemGenres.some((genre) => excluded.includes(genre))) return false;
+        return genres.every((genre) => itemGenres.includes(genre));
+      },
+      fullPages: genres.length > 0 ? FILTERED_TRENDING_PAGES : LIST_PAGES,
+    };
+  }
+
+  const params: Record<string, string> = {
+    sort_by: 'popularity.desc',
+    include_adult: 'false',
+  };
+  // A comma in `with_genres` means "all of these", matching the web client.
+  if (genres.length > 0) params.with_genres = genres.join(',');
+  if (kind === 'tv') params.without_genres = [TV_TALK, TV_NEWS, TV_SOAP].join('|');
+  if (kind === 'movie') params.include_video = 'false';
+  params['vote_count.gte'] = String(MIN_VOTES[kind]);
+
+  return { path: `/discover/${kind}`, params, keep: () => true, fullPages: LIST_PAGES };
+}
+
+/**
+ * One page of a list, resolved to TVDB titles.
+ *
+ * A page maps to exactly one TMDB page, so it carries as many titles as
+ * survive filtering and TVDB lookup — usually most of 20, occasionally a
+ * handful for a narrow genre on trending. The client keeps paging while its
+ * scroll sentinel is visible, so a thin page just means another request.
+ */
+export function listPage(
+  list: ListName,
+  type: ApiType,
+  genres: number[],
+  page: number,
+  { force = false } = {},
+): Promise<CatalogPage> {
   const kind = tmdbType(type);
-  const key = `tmdb:trending:${kind}:${[...genres].sort((a, b) => a - b).join(',')}`;
+  const key = `tmdb:${list}:${kind}:${genreKey(genres)}:p${page}`;
 
   return (force ? tvdb.refresh : tvdb.cached)(key, LIST_TTL_MS, async () => {
-    const results = await pages(
-      `/trending/${kind}/week`,
-      {},
-      genres.length > 0 ? FILTERED_TRENDING_PAGES : LIST_PAGES,
-    );
-
-    const excluded = kind === 'tv' ? [TV_TALK, TV_NEWS] : [];
-    const filtered = results.filter((item) => {
-      const itemGenres = item.genre_ids ?? [];
-      if (itemGenres.some((genre) => excluded.includes(genre))) return false;
-      return genres.every((genre) => itemGenres.includes(genre));
+    const spec = specFor(list, kind, genres);
+    const json = await tmdbJson<{ results?: TmdbListItem[]; total_pages?: number }>(spec.path, {
+      ...spec.params,
+      page: String(page),
     });
 
-    return resolve(kind, filtered);
+    return {
+      data: await resolve(kind, (json.results ?? []).filter(spec.keep)),
+      page,
+      hasMore: page < Math.min(json.total_pages ?? 0, MAX_PAGES),
+    };
   });
+}
+
+/**
+ * The head of a list as one array, for the home page's rails.
+ *
+ * Built from the same cached pages Discover scrolls through, so warming the
+ * home page warms the first pages of Discover too.
+ */
+function fullList(list: ListName, type: ApiType, genres: number[], force: boolean) {
+  const kind = tmdbType(type);
+  const key = `tmdb:${list}:${kind}:${genreKey(genres)}`;
+
+  return (force ? tvdb.refresh : tvdb.cached)(key, LIST_TTL_MS, async () => {
+    const spec = specFor(list, kind, genres);
+    const pages = await Promise.all(
+      Array.from({ length: spec.fullPages }, (_, index) =>
+        listPage(list, type, genres, index + 1, { force }).catch((error) => {
+          // A later page failing shouldn't sink the ones that loaded.
+          if (index === 0) throw error;
+          return null;
+        }),
+      ),
+    );
+
+    // TMDB's ordering shifts between page requests, so a title can land on two
+    // pages; the first appearance wins.
+    const seen = new Set<number>();
+    const items: CatalogItem[] = [];
+    for (const page of pages) {
+      for (const item of page?.data ?? []) {
+        if (seen.has(item.id)) continue;
+        seen.add(item.id);
+        items.push(item);
+      }
+    }
+    return items;
+  });
+}
+
+/** What's trending this week, optionally narrowed to genres (all must match). */
+export function trending(type: ApiType, genres: number[] = [], { force = false } = {}) {
+  return fullList('trending', type, genres, force);
 }
 
 /** The most popular titles right now, optionally narrowed to genres. */
 export function popular(type: ApiType, genres: number[] = [], { force = false } = {}) {
-  const kind = tmdbType(type);
-  const key = `tmdb:popular:${kind}:${[...genres].sort((a, b) => a - b).join(',')}`;
-
-  return (force ? tvdb.refresh : tvdb.cached)(key, LIST_TTL_MS, async () => {
-    const params: Record<string, string> = {
-      sort_by: 'popularity.desc',
-      'vote_count.gte': String(MIN_VOTES[kind]),
-      include_adult: 'false',
-    };
-    // A comma in `with_genres` means "all of these", matching the web client.
-    if (genres.length > 0) params.with_genres = genres.join(',');
-    if (kind === 'tv') params.without_genres = [TV_TALK, TV_NEWS, TV_SOAP].join('|');
-    if (kind === 'movie') params.include_video = 'false';
-
-    return resolve(kind, await pages(`/discover/${kind}`, params, LIST_PAGES));
-  });
+  return fullList('popular', type, genres, force);
 }
 
 // --- Warming ---------------------------------------------------------------
@@ -357,7 +436,7 @@ export function popular(type: ApiType, genres: number[] = [], { force = false } 
 const WARM_INTERVAL_MS = 25 * 60 * 1000;
 
 /**
- * Keep the four lists the home page opens with warm.
+ * Keep the lists the home page opens with warm.
  *
  * A cold list costs one TVDB lookup per title — a few seconds the first time.
  * Refreshing on a timer means that cost is paid in the background instead of
