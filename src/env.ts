@@ -104,6 +104,12 @@ export const env = {
   // tokens with a default that is public in this repo.
   jwtSecret,
   tvdbKey: read('TVDB_KEY'),
+  /**
+   * Optional. With it, trending and popular lists come from TMDB; without it
+   * they fall back to TVDB's own score. Accepts a v3 API key or a v4 read
+   * access token.
+   */
+  tmdbKey: process.env.TMDB_KEY?.trim() ?? '',
 
   databaseUrl,
   databaseAuthToken: readDatabaseAuthToken(),

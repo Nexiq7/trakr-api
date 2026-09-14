@@ -9,6 +9,11 @@ Serves the trakr frontend: authentication, the user's collection, and a proxy
 layer over [TheTVDB v4 API](https://thetvdb.com/api-static/v4/index.html) that
 prefers English titles and overviews when a title's primary language isn't English.
 
+Trending and popular lists can optionally come from [TMDB](https://www.themoviedb.org),
+whose charts reflect what people are watching — TVDB has no trending data of
+its own. Each TMDB title is resolved to its TVDB id, so details pages and
+tracking stay on TVDB either way.
+
 This repo and [trakr-web](https://github.com/Nexiq7/trakr-web) together are the
 whole product — nothing else runs behind [trakr.lol](https://trakr.lol).
 
@@ -28,8 +33,13 @@ docker compose up
 Open [http://localhost:8080](http://localhost:8080). The API listens on
 `:3007`; the database lives on a named Docker volume, so it survives restarts.
 
-A free TVDB API key is the only external dependency — grab one at
+A free TVDB API key is the only required external dependency — grab one at
 [thetvdb.com/api-information](https://thetvdb.com/api-information).
+
+For better trending and popular lists, also add a free TMDB key as `TMDB_KEY`
+([themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)). Without
+one, those lists fall back to TVDB's own score. If TMDB rejects the key, the API
+logs an error and serves the TVDB lists until it's restarted with a working one.
 
 ## 🚀 Run it from source
 
@@ -99,5 +109,7 @@ Hono on Bun, Drizzle ORM, SQLite/Turso (libsql), bcryptjs for auth.
 ## 📄 License
 
 [MIT](LICENSE) © Nexiq7. Series and episode data comes from TheTVDB and remains
-subject to [their API terms](https://thetvdb.com/api-information) — this license
-covers the code only.
+subject to [their API terms](https://thetvdb.com/api-information); trending and
+popular lists, when enabled, come from TMDB under
+[theirs](https://www.themoviedb.org/api-terms-of-use). This product uses the TMDB
+API but is not endorsed or certified by TMDB. This license covers the code only.

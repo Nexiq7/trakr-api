@@ -80,7 +80,9 @@ type Entry = { data: any; expiresAt: number };
 
 const cache = new Map<string, Entry>();
 const inFlight = new Map<string, Promise<any>>();
-const MAX_CACHE_ENTRIES = 2_000;
+// TMDB-to-TVDB id mappings share this cache and add one small entry per title,
+// so the ceiling leaves room for a few thousand of them alongside everything else.
+const MAX_CACHE_ENTRIES = 6_000;
 
 function evictIfNeeded() {
   if (cache.size <= MAX_CACHE_ENTRIES) return;
@@ -100,7 +102,17 @@ function evictIfNeeded() {
 export async function cached<T>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T> {
   const hit = cache.get(key);
   if (hit && hit.expiresAt > Date.now()) return hit.data;
+  return refresh(key, ttlMs, fn);
+}
 
+/**
+ * Recompute a cached value and replace it, ignoring whatever is stored.
+ *
+ * The stored value keeps being served to `cached` callers until the new one
+ * lands, which is what lets a background job renew a list without a window
+ * where readers find nothing and start their own fetch.
+ */
+export function refresh<T>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T> {
   // Share one request between callers that all miss at the same moment,
   // instead of stampeding TVDB when a popular key expires.
   const pending = inFlight.get(key);
@@ -243,5 +255,25 @@ export function getMediaDetails(apiType: string, id: string | number, opts: { ep
     }
 
     return data;
+  });
+}
+
+/** A TVDB record found by an id from another service. */
+export interface RemoteIdMatch {
+  series?: { id: number; name?: string; image?: string };
+  movie?: { id: number; name?: string; image?: string };
+}
+
+/**
+ * TVDB records carrying an IMDb id.
+ *
+ * TVDB's remote-id search accepts ids from several services, but numeric ids
+ * collide between them — TMDB's id for Inception returns an unrelated series.
+ * IMDb ids are prefixed (`tt…`), so they are the only ones safe to look up.
+ */
+export function findByImdbId(imdbId: string) {
+  return cached(`remoteid:${imdbId}`, 7 * 24 * 60 * 60 * 1000, async () => {
+    const json = await tvdbJson(`/search/remoteid/${encodeURIComponent(imdbId)}`);
+    return (json.data ?? []) as RemoteIdMatch[];
   });
 }
