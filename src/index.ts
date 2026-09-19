@@ -43,6 +43,11 @@ app.use('*', async (c, next) => {
   const start = Date.now();
   await next();
 
+  // Docker's health check calls /health every 30 seconds, nearly 3,000 lines a
+  // day that say nothing. A healthy probe isn't logged; a failing one still is,
+  // since that's the one worth seeing.
+  if (c.req.path === '/health' && c.res.status < 400) return;
+
   const jwtPayload = c.get('jwtPayload') as { id: number } | undefined;
   logger.info('request', {
     method: c.req.method,
