@@ -122,6 +122,12 @@ export const env = {
     .filter(Boolean),
 
   port: Number(process.env.PORT) || 3007,
+  /**
+   * The git commit the image was built from, stamped by the deploy workflow.
+   * Logged on every line so a spike in errors can be tied to the deploy that
+   * caused it. `dev` when running from source.
+   */
+  version: process.env.APP_VERSION?.trim() || 'dev',
   isProduction: process.env.NODE_ENV === 'production',
 };
 

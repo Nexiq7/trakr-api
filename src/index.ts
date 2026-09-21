@@ -1,5 +1,6 @@
-import { Hono } from 'hono';
-import { jwt, sign } from 'hono/jwt';
+import { Hono, type Context } from 'hono';
+import { jwt, sign, verify, decode } from 'hono/jwt';
+import { routePath } from 'hono/route';
 import { cors } from 'hono/cors';
 import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
@@ -11,7 +12,8 @@ import { env } from './env';
 import { db } from './db';
 import { users, watchlist } from './db/schema';
 import { rateLimit } from './rate-limit';
-import { logger } from './logger';
+import { logger, errorFields } from './logger';
+import { requestContext, type RequestContext } from './request-context';
 import { getClientIp } from './ip';
 import * as tvdb from './tvdb';
 import * as tmdb from './tmdb';
@@ -36,26 +38,106 @@ const TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 // --- GLOBAL MIDDLEWARE ---
 
-// One line per request, after it's handled, so the status code (including
-// ones `onError` produces) is known. Registered first so the timer covers
-// every downstream middleware and the route handler.
+declare module 'hono' {
+  interface ContextVariableMap {
+    /** Why a request failed, carried to its request log line. */
+    errorMessage: string;
+  }
+}
+
+/** Request ids a caller may supply in X-Request-Id; anything else is replaced. */
+const REQUEST_ID_RE = /^[A-Za-z0-9._-]{8,64}$/;
+
+interface Identity {
+  userId?: number;
+  username?: string;
+  /** Set when a token was sent but couldn't be trusted. */
+  tokenProblem?: 'expired' | 'invalid';
+}
+
+/**
+ * Who sent the request, when it carries a token.
+ *
+ * Read on every route, not only the protected ones, so a signed-in user's
+ * browsing is attributed to them too. It never rejects anything: enforcement
+ * stays with the jwt() middleware on /api. A token that fails verification
+ * attributes nothing — its claims can't be trusted — but the log says whether
+ * it had expired or was invalid, which is what tells a stale session from
+ * someone probing.
+ */
+async function readIdentity(c: Context): Promise<Identity> {
+  const header = c.req.header('authorization');
+  if (!header?.startsWith('Bearer ')) return {};
+  const token = header.slice('Bearer '.length).trim();
+
+  try {
+    const payload = await verify(token, env.jwtSecret, 'HS256');
+    return {
+      userId: typeof payload.id === 'number' ? payload.id : undefined,
+      username: typeof payload.username === 'string' ? payload.username : undefined,
+    };
+  } catch {
+    try {
+      const { payload } = decode(token);
+      if (typeof payload.exp === 'number' && payload.exp * 1000 <= Date.now()) {
+        return { tokenProblem: 'expired' };
+      }
+    } catch {
+      // Not a JWT at all.
+    }
+    return { tokenProblem: 'invalid' };
+  }
+}
+
+/**
+ * One line per request, after it's handled, so the status code (including
+ * ones `onError` produces) is known. Registered first so the timer covers
+ * every downstream middleware and the route handler.
+ *
+ * Everything the request does runs inside its request context, so every other
+ * line logged along the way carries the same `requestId` and user. The id is
+ * returned in `X-Request-Id`, and in the body of a 500, so a user reporting a
+ * problem can hand over the one string that finds all of it.
+ */
 app.use('*', async (c, next) => {
   const start = Date.now();
-  await next();
+  const incoming = c.req.header('x-request-id');
+  const requestId = incoming && REQUEST_ID_RE.test(incoming) ? incoming : crypto.randomUUID();
+  const { tokenProblem, ...identity } = await readIdentity(c);
+  const context: RequestContext = { requestId, ...identity };
 
-  // Docker's health check calls /health every 30 seconds, nearly 3,000 lines a
-  // day that say nothing. A healthy probe isn't logged; a failing one still is,
-  // since that's the one worth seeing.
-  if (c.req.path === '/health' && c.res.status < 400) return;
+  await requestContext.run(context, async () => {
+    await next();
+    c.header('X-Request-Id', requestId);
 
-  const jwtPayload = c.get('jwtPayload') as { id: number } | undefined;
-  logger.info('request', {
-    method: c.req.method,
-    path: c.req.path,
-    status: c.res.status,
-    durationMs: Date.now() - start,
-    ip: getClientIp(c),
-    userId: jwtPayload?.id,
+    // Docker's health check calls /health every 30 seconds, nearly 3,000 lines
+    // a day that say nothing. A healthy probe isn't logged; a failing one
+    // still is, since that's the one worth seeing.
+    if (c.req.path === '/health' && c.res.status < 400) return;
+    // Likewise the browser's CORS preflight: every authenticated call is
+    // preceded by an OPTIONS request that carries no user and does nothing.
+    if (c.req.method === 'OPTIONS' && c.res.status < 400) return;
+
+    const status = c.res.status;
+    // The registered pattern (`/tvdb/details/:type/:id`), so dashboards can
+    // group by route instead of by every id that was ever requested.
+    const route = routePath(c, -1);
+
+    const fields = {
+      event: 'http.request',
+      method: c.req.method,
+      route: route && route !== '*' && route !== '/*' ? route : undefined,
+      path: c.req.path,
+      status,
+      durationMs: Date.now() - start,
+      ip: getClientIp(c),
+      userAgent: c.req.header('user-agent')?.slice(0, 200),
+      error: c.get('errorMessage'),
+      tokenProblem,
+    };
+
+    if (status >= 500) logger.error('request', fields);
+    else logger.info('request', fields);
   });
 });
 
@@ -68,7 +150,7 @@ app.use(
     origin: env.origins,
     allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'Authorization'],
-    exposeHeaders: ['Content-Length'],
+    exposeHeaders: ['Content-Length', 'X-Request-Id'],
     maxAge: 600,
     credentials: true,
   })
@@ -90,16 +172,19 @@ const STATUS_FALLBACKS: Record<number, string> = {
 app.onError((err, c) => {
   if (err instanceof HTTPException) {
     const message = err.message || STATUS_FALLBACKS[err.status] || 'Request failed';
+    c.set('errorMessage', message);
     return c.json({ error: message }, err.status);
   }
 
   logger.error('unhandled error', {
+    event: 'http.unhandled_error',
     method: c.req.method,
     path: c.req.path,
-    error: err instanceof Error ? err.message : String(err),
-    stack: err instanceof Error ? err.stack : undefined,
+    ...errorFields(err),
   });
-  return c.json({ error: 'Something went wrong' }, 500);
+  c.set('errorMessage', err instanceof Error ? err.message : String(err));
+  // The request id is the one thing a user can report that finds this error.
+  return c.json({ error: 'Something went wrong', requestId: requestContext.getStore()?.requestId }, 500);
 });
 
 app.notFound((c) => c.json({ error: 'Not found' }, 404));
@@ -136,7 +221,10 @@ app.post('/auth/signup', authLimiter, async (c) => {
   const { username, password } = parseSignup(await jsonBody(c));
 
   const existing = await db.select().from(users).where(eq(users.username, username)).get();
-  if (existing) return c.json({ error: 'Username taken' }, 409);
+  if (existing) {
+    logger.info('signup rejected', { event: 'auth.signup_rejected', reason: 'username_taken', username });
+    return c.json({ error: 'Username taken' }, 409);
+  }
 
   const passwordHash = await bcrypt.hash(password, 10);
 
@@ -146,12 +234,15 @@ app.post('/auth/signup', authLimiter, async (c) => {
   } catch (e) {
     // Two signups racing for the same name: the unique index is the source of
     // truth, and the loser lands here.
-    if (String(e).includes('UNIQUE')) return c.json({ error: 'Username taken' }, 409);
+    if (String(e).includes('UNIQUE')) {
+      logger.info('signup rejected', { event: 'auth.signup_rejected', reason: 'username_taken', username });
+      return c.json({ error: 'Username taken' }, 409);
+    }
     throw e;
   }
 
   const user = created[0]!;
-  logger.info('user signed up', { userId: user.id, username: user.username });
+  logger.info('user signed up', { event: 'auth.signup', userId: user.id, username: user.username });
   return c.json({ token: await issueToken(user), userId: user.id }, 201);
 });
 
@@ -166,11 +257,18 @@ app.post('/auth/login', authLimiter, async (c) => {
   const valid = await bcrypt.compare(password, passwordHash);
 
   if (!user || !valid) {
-    logger.warn('login failed', { username });
+    // The client only ever hears "invalid credentials"; the log keeps the real
+    // reason, which is what separates a typo from someone guessing usernames.
+    logger.warn('login failed', {
+      event: 'auth.login_failed',
+      reason: user ? 'wrong_password' : 'unknown_user',
+      username,
+      userId: user?.id,
+    });
     return c.json({ error: 'Invalid credentials' }, 401);
   }
 
-  logger.info('user logged in', { userId: user.id, username: user.username });
+  logger.info('user logged in', { event: 'auth.login', userId: user.id, username: user.username });
   return c.json({ token: await issueToken(user) });
 });
 
@@ -200,7 +298,14 @@ app.post('/api/track', async (c) => {
       .where(eq(watchlist.id, existing.id))
       .returning();
 
-    logger.info('watchlist item updated', { userId: payload.id, mediaId, status, score });
+    logger.info('watchlist item updated', {
+      event: 'watchlist.update',
+      mediaId,
+      status,
+      score,
+      previousStatus: existing.status,
+      previousScore: existing.score,
+    });
     return c.json(updated[0]);
   }
 
@@ -209,7 +314,7 @@ app.post('/api/track', async (c) => {
     .values({ userId: payload.id, mediaId, type, score, status, createdAt: new Date() })
     .returning();
 
-  logger.info('watchlist item added', { userId: payload.id, mediaId, type, status, score });
+  logger.info('watchlist item added', { event: 'watchlist.add', mediaId, type, status, score });
   return c.json(inserted[0]);
 });
 
@@ -217,11 +322,19 @@ app.delete('/api/track/:mediaId', async (c) => {
   const payload = c.get('jwtPayload') as JwtPayload;
   const mediaId = c.req.param('mediaId');
 
-  await db
+  const removed = await db
     .delete(watchlist)
-    .where(and(eq(watchlist.userId, payload.id), eq(watchlist.mediaId, mediaId)));
+    .where(and(eq(watchlist.userId, payload.id), eq(watchlist.mediaId, mediaId)))
+    .returning({ status: watchlist.status, score: watchlist.score });
 
-  logger.info('watchlist item removed', { userId: payload.id, mediaId });
+  logger.info('watchlist item removed', {
+    event: 'watchlist.remove',
+    mediaId,
+    // Nothing matched: the client removed something already gone.
+    found: removed.length > 0,
+    previousStatus: removed[0]?.status,
+    previousScore: removed[0]?.score,
+  });
   return c.json({ success: true });
 });
 
@@ -284,6 +397,7 @@ async function fromTmdb<T>(load: () => Promise<T>): Promise<T | null> {
   } catch (error) {
     if (error instanceof tmdb.UnmappedGenre) return null;
     logger.warn('tmdb list failed, using tvdb', {
+      event: 'tmdb.list_fallback',
       error: error instanceof Error ? error.message : String(error),
     });
     return null;
@@ -393,7 +507,32 @@ app.get('/tvdb/browse/:type', async (c) => {
   });
 });
 
-logger.info('trakr backend listening', { port: env.port, tmdb: tmdb.isEnabled() });
+logger.info('trakr backend listening', {
+  event: 'app.start',
+  port: env.port,
+  tmdb: tmdb.isEnabled(),
+  runtime: `bun ${Bun.version}`,
+});
+
+// A crash that only shows up as a container restart can't be diagnosed. Log
+// it, then exit rather than carry on in an unknown state; Docker restarts us.
+process.on('uncaughtException', (error) => {
+  logger.error('uncaught exception', { event: 'app.crash', ...errorFields(error) });
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  logger.error('unhandled promise rejection', { event: 'app.crash', ...errorFields(reason) });
+  process.exit(1);
+});
+
+// A deploy stops the old container with SIGTERM. Logging it is what tells a
+// deliberate restart apart from a crash when reading back through the logs.
+for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(signal, () => {
+    logger.info('stopping', { event: 'app.stop', signal });
+    process.exit(0);
+  });
+}
 tmdb.startWarming();
 
 export default {

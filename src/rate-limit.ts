@@ -42,7 +42,7 @@ export function rateLimit(opts: { name: string; windowMs: number; max: number; m
     if (bucket.count >= max) {
       const retryAfter = Math.ceil((bucket.resetAt - now) / 1000);
       c.header('Retry-After', String(retryAfter));
-      logger.warn('rate limit exceeded', { limiter: name, ip, path: c.req.path });
+      logger.warn('rate limit exceeded', { event: 'security.rate_limited', limiter: name, ip, path: c.req.path });
       return c.json({ error: message }, 429);
     }
 
