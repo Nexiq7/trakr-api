@@ -1,6 +1,11 @@
 FROM oven/bun:1-alpine
 
 ENV NODE_ENV=production
+
+# The commit this image was built from, logged on every line. Passed by the
+# deploy workflow; `dev` when built by hand.
+ARG APP_VERSION=dev
+ENV APP_VERSION=$APP_VERSION
 WORKDIR /app
 
 # Dependencies first, so code changes don't invalidate the install layer.

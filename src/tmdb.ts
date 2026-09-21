@@ -131,7 +131,7 @@ async function tmdbJson<T>(path: string, params: Record<string, string> = {}): P
 
   if (res.status === 401 && !rejected) {
     rejected = true;
-    logger.error('TMDB rejected TMDB_KEY; serving TVDB lists until restart', { path });
+    logger.error('TMDB rejected TMDB_KEY; serving TVDB lists until restart', { event: 'tmdb.key_rejected', path });
   }
   if (!res.ok) throw new Error(`TMDB ${path} failed with status ${res.status}`);
   return (await res.json()) as T;
@@ -192,6 +192,7 @@ async function resolve(type: TmdbType, items: TmdbListItem[]): Promise<CatalogIt
     items.map((item) =>
       tvdbIdFor(type, item.id).catch((error) => {
         logger.warn('tmdb mapping failed', {
+          event: 'tmdb.mapping_failed',
           type,
           tmdbId: item.id,
           error: error instanceof Error ? error.message : String(error),
@@ -465,13 +466,14 @@ export function startWarming() {
       } catch (error) {
         failed += 1;
         logger.warn('tmdb warm failed', {
+          event: 'tmdb.warm_failed',
           list: name,
           error: error instanceof Error ? error.message : String(error),
         });
       }
     }
     if (failed < lists.length) {
-      logger.info('tmdb lists warmed', { durationMs: Date.now() - started, failed });
+      logger.info('tmdb lists warmed', { event: 'tmdb.warmed', durationMs: Date.now() - started, failed });
     }
   };
 
